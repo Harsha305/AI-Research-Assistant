@@ -34,12 +34,14 @@ class AgentState(TypedDict):
     research_results: List[Dict]
     draft_summary: str
     final_report: str
+    suggestions: str
     reasoning_trace: List[Dict]
     citations: List[str]
     vector_db: Dict
     message_queue: deque
     retries: int
     max_retries: int
+    num_verify: int
 
 IN_MEMORY_VECTOR_DB = {}
 TASK_QUEUE = deque()
@@ -77,7 +79,6 @@ def cached_llm(goal):
     )
     
     clean_output = re.sub(r"^```(?:json)?|```$", "", response.content.strip(), flags=re.MULTILINE).strip()
-    print("Raw LLM output:", clean_output)
     subtasks = json.loads(clean_output)
 
     # Save to cache
@@ -87,6 +88,37 @@ def cached_llm(goal):
 
     print("Saved LLM subtasks to cache for goal:", goal)
     return subtasks
+
+
+
+def cached_llm_verifier(goal, report):
+    
+    # TODO Implement cache
+    # Call your LLM
+    response = llm.invoke(
+    f"""Check the following main body of report on the topic '{goal}' and provide suggestions for improving the body.
+    Respond with a JSON object with a single key "suggestions" whose value is a single string containing the suggestions.
+    If no major changes are required, respond with: {{"suggestions": ""}}.
+
+    Report body:
+    \"\"\"{report}\"\"\"
+    """
+    )
+
+    response_content = response.content.strip()
+    # Step 1: Remove ```json or ``` code fences
+    cleaned = re.sub(r"^```(?:json)?|```$", "", response_content, flags=re.MULTILINE).strip()
+
+    # Step 2: Extract the suggestions string (handles single/double quotes, optional spaces)
+    match = re.search(
+        r"""["']?suggestions["']?\s*:\s*["']([^"']*)["']""",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    suggestions = match.group(1) if match else ""
+    
+    return suggestions
 
 
 
@@ -274,7 +306,7 @@ def summarizer_agent(state: AgentState):
     
     print("[SUMMARIZER]: Synthesizing a draft report from research results.")
     
-    custom_crew = CustomCrew(state['goal'])
+    custom_crew = CustomCrew(state['goal'], state['draft_summary'], state['suggestions'])
     result = custom_crew.run()
 
 
@@ -290,13 +322,20 @@ def verifier_agent(state: AgentState):
     print("\n[AGENT]: Verifier is active...")
     print("[VERIFIER]: Reviewing the draft report for accuracy and completeness.")
 
+
+    if state['num_verify'] >= 3:
+        state['suggestions'] = ""
+    else:
+        suggestions = cached_llm_verifier(state['goal'], state['draft_summary'])
+        state['suggestions'] = suggestions
+        state['num_verify'] += 1
+
+    if state['suggestions'] != "":
+        return state
+
+    
     citations = [f"[{i+1}] {doc['source']}" for i, doc in enumerate(state['research_results'])]
     
-    if "placeholder" in state['draft_summary'].lower():
-        print("[VERIFIER]: Draft seems incomplete. Requesting more research.")
-        state['subtasks'].append(f"Additional research on {state['goal']}")
-        state['reasoning_trace'].append({"agent": "Verifier", "action": "Requesting more research", "details": "Draft was incomplete. Added a new research task."})
-        return state
         
     final_report = f"Final Market Research Report\n\n**Goal:** {state['goal']}\n\n"
     final_report += state['draft_summary']
@@ -320,12 +359,13 @@ def should_continue(state: AgentState):
 
 def should_finalize(state: AgentState):
     """Determines if the report is ready to be finalized."""
-    if "placeholder" in state['final_report'].lower() or not state['final_report']:
+    if state['suggestions'] != "":
         print("[WORKFLOW]: Report is not finalized. Passing back to summarizer.")
         return "summarize"
     else:
         print("[WORKFLOW]: Report is finalized. Ending workflow.")
         return "end"
+
 
 
 # Initialize the graph
@@ -372,11 +412,13 @@ if __name__ == "__main__":
         "research_results": [],
         "draft_summary": "",
         "final_report": "",
+        "suggestions": "",
         "reasoning_trace": [],
         "citations": [],
         "vector_db": IN_MEMORY_VECTOR_DB,
         "message_queue": TASK_QUEUE,
         "retries": 0,
+        "num_verify": 0,
         "max_retries": 2
     }
     
